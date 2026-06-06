@@ -1,0 +1,223 @@
+# docker-compose.stellar.yml
+# ---------------------------------------------------------------------------
+# Customized single-file NVIDIA GPU stack for STELLAR-DEV (Docker Desktop /
+# WSL2 + RTX 3080 Ti), deployed via a Portainer Git Stack. Tracks the MAIN
+# branch (stable).
+#
+# Tailored copy of docker-compose.gpu-nvidia.yml. It is a NEW file (not an
+# edit of the upstream compose) so merging upstream never conflicts with it.
+# Keep the services/env in sync with docker-compose.gpu-nvidia.yml when you
+# merge upstream; only the VOLUME wiring is intentionally different:
+#
+#   HYBRID STORAGE
+#   - Transactional data stays on LOCAL Docker named volumes (fast WSL2 ext4,
+#     correct SQLite file locking): app.db, auth.json, memory.json, settings,
+#     ChromaDB vector store, and the Cookbook-installed Python engines (.local,
+#     which are imported/exec'd at runtime and must not live on CIFS).
+#   - Large / read-mostly bulk lives on the NAS (192.168.1.26) over CIFS:
+#     the HuggingFace model cache and user artifact dirs.
+#
+# Set these as Portainer STACK ENVIRONMENT VARIABLES (not committed here):
+#   NAS_USER, NAS_PASS            - least-privilege NAS account for the share
+#   NAS_SHARE                     - optional, defaults to //192.168.1.26/odysseus
+#   HF_TOKEN, HUGGING_FACE_HUB_TOKEN
+#   ODYSSEUS_ADMIN_USER, ODYSSEUS_ADMIN_PASSWORD
+#   SEARXNG_SECRET
+#   APP_BIND                      - 127.0.0.1 (default) or 0.0.0.0 for LAN
+#
+# NAS prerequisite: create the share and pre-create these subfolders:
+#   huggingface, uploads, generated_images, mail-attachments,
+#   personal_docs, personal_uploads
+#
+# Requires the NVIDIA Container Toolkit on the host (bundled with Docker
+# Desktop/WSL2 + a current Windows NVIDIA driver).
+# ---------------------------------------------------------------------------
+services:
+  odysseus:
+    build: .
+    ports:
+      - "${APP_BIND:-127.0.0.1}:${APP_PORT:-7000}:7000"
+    volumes:
+      # --- LOCAL (fast NVMe-backed WSL2 named volumes) -------------------
+      - odysseus-data:/app/data            # SQLite app.db, auth, memory, settings
+      - odysseus-logs:/app/logs
+      - odysseus-ssh:/app/.ssh             # Cookbook remote-server SSH identity
+      - odysseus-local:/app/.local         # Cookbook engines (vLLM/llama.cpp)
+      # --- NAS (CIFS, bulk / read-mostly) -------------------------------
+      - nas-huggingface:/app/.cache/huggingface
+      - nas-uploads:/app/data/uploads
+      - nas-generated:/app/data/generated_images
+      - nas-attachments:/app/data/mail-attachments
+      - nas-personal-docs:/app/data/personal_docs
+      - nas-personal-uploads:/app/data/personal_uploads
+    extra_hosts:
+      # Lets the container reach local services on the Docker host, including
+      # Ollama at http://host.docker.internal:11434.
+      - "host.docker.internal:host-gateway"
+    environment:
+      - LLM_HOST=${LLM_HOST:-localhost}
+      - LLM_HOSTS=${LLM_HOSTS:-}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - OLLAMA_BASE_URL=${OLLAMA_BASE_URL:-}
+      - RESEARCH_LLM_ENDPOINT=${RESEARCH_LLM_ENDPOINT:-}
+      - HF_TOKEN=${HF_TOKEN:-}
+      - HUGGING_FACE_HUB_TOKEN=${HUGGING_FACE_HUB_TOKEN:-}
+      - SEARXNG_INSTANCE=http://searxng:8080
+      - CHROMADB_HOST=chromadb
+      - CHROMADB_PORT=8000
+      - DATABASE_URL=${DATABASE_URL:-sqlite:///./data/app.db}
+      - AUTH_ENABLED=${AUTH_ENABLED:-true}
+      - LOCALHOST_BYPASS=${LOCALHOST_BYPASS:-false}
+      - ODYSSEUS_ADMIN_USER=${ODYSSEUS_ADMIN_USER:-admin}
+      - ODYSSEUS_ADMIN_PASSWORD=${ODYSSEUS_ADMIN_PASSWORD:-}
+      - ALLOWED_ORIGINS=${ALLOWED_ORIGINS:-http://localhost,http://127.0.0.1}
+      - SECURE_COOKIES=${SECURE_COOKIES:-false}
+      - EMBEDDING_URL=${EMBEDDING_URL:-}
+      - EMBEDDING_MODEL=${EMBEDDING_MODEL:-}
+      - FASTEMBED_MODEL=${FASTEMBED_MODEL:-sentence-transformers/all-MiniLM-L6-v2}
+      - FASTEMBED_CACHE_PATH=${FASTEMBED_CACHE_PATH:-}
+      - CLEANUP_INTERVAL_HOURS=${CLEANUP_INTERVAL_HOURS:-24}
+      - ODYSSEUS_INPROCESS_POLLERS=${ODYSSEUS_INPROCESS_POLLERS:-1}
+      - ODYSSEUS_INPROCESS_TASKS=${ODYSSEUS_INPROCESS_TASKS:-1}
+      - ODYSSEUS_SCRIPT_HOST=${ODYSSEUS_SCRIPT_HOST:-localhost}
+      - DATA_BRAVE_API_KEY=${DATA_BRAVE_API_KEY:-}
+      - GOOGLE_API_KEY=${GOOGLE_API_KEY:-}
+      - GOOGLE_PSE_CX=${GOOGLE_PSE_CX:-}
+      - TAVILY_API_KEY=${TAVILY_API_KEY:-}
+      - SERPER_API_KEY=${SERPER_API_KEY:-}
+      # PUID / PGID — the user/group the container drops to before running
+      # uvicorn (entrypoint chowns mounts to match). Must match the uid/gid
+      # baked into the CIFS volume mount options below (1000:1000).
+      - PUID=${PUID:-1000}
+      - PGID=${PGID:-1000}
+      # NVIDIA overlay.
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+    depends_on:
+      searxng:
+        condition: service_healthy
+      chromadb:
+        condition: service_started
+    restart: unless-stopped
+    # NVIDIA overlay — honored by Portainer's `docker compose`.
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  chromadb:
+    image: docker.io/chromadb/chroma:latest
+    ports:
+      - "${CHROMADB_BIND:-127.0.0.1}:8100:8000"
+    volumes:
+      - chromadb-data:/chroma/chroma   # SQLite-backed vector store → LOCAL
+    environment:
+      - ANONYMIZED_TELEMETRY=FALSE
+    restart: unless-stopped
+
+  searxng:
+    # Pinned, not :latest — odysseus waits on searxng's healthcheck
+    # (depends_on: condition: service_healthy), so a broken upstream `latest`
+    # tag blocks the whole app from starting. 2026.6.2 crashes on boot with
+    # `KeyError: 'default_doi_resolver'`, failing the healthcheck (issue #1414).
+    # Bump this deliberately after verifying a newer tag boots clean.
+    image: docker.io/searxng/searxng:2026.5.31-7159b8aed
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        set -eu
+        if [ ! -s /etc/searxng/settings.yml ] || grep -q 'odysseus-local-searxng-json-2026-05-30\|__SEARXNG_SECRET__' /etc/searxng/settings.yml; then
+          secret="$${SEARXNG_SECRET:-}"
+          if [ -z "$$secret" ]; then
+            secret="$$(python -c 'import secrets; print(secrets.token_urlsafe(48))')"
+          fi
+          sed "s|__SEARXNG_SECRET__|$$secret|g" /tmp/searxng-settings.yml.template > /etc/searxng/settings.yml
+        fi
+        exec /usr/local/searxng/entrypoint.sh
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - searxng-data:/etc/searxng
+      - ./config/searxng/settings.yml:/tmp/searxng-settings.yml.template:ro,z
+    environment:
+      - SEARXNG_BASE_URL=http://localhost:8080/
+      - SEARXNG_SECRET=${SEARXNG_SECRET:-}
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETGID
+      - SETUID
+      - DAC_OVERRIDE
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8080/', timeout=5).read(1)\""]
+      interval: 5s
+      timeout: 6s
+      retries: 20
+      start_period: 10s
+    restart: unless-stopped
+
+  ntfy:
+    image: docker.io/binwiederhier/ntfy
+    command: serve
+    ports:
+      - "${NTFY_BIND:-127.0.0.1}:8091:80"
+    volumes:
+      - ntfy-cache:/var/cache/ntfy
+    environment:
+      - NTFY_BASE_URL=${NTFY_BASE_URL:-http://localhost:8091}
+    restart: unless-stopped
+
+volumes:
+  # --- LOCAL named volumes (live in the WSL2 VM disk) ---------------------
+  odysseus-data:
+  odysseus-logs:
+  odysseus-ssh:
+  odysseus-local:
+  searxng-data:
+  chromadb-data:
+  ntfy-cache:
+
+  # --- NAS CIFS volumes (192.168.1.26) -----------------------------------
+  # uid/gid 1000 must match PUID/PGID so the dropped odysseus user can write.
+  # vers=3.0 is broadly compatible; raise to 3.1.1 if the NAS supports it.
+  nas-huggingface:
+    driver: local
+    driver_opts:
+      type: cifs
+      o: "username=${NAS_USER},password=${NAS_PASS},uid=1000,gid=1000,file_mode=0770,dir_mode=0770,vers=3.0"
+      device: "${NAS_SHARE:-//192.168.1.26/odysseus}/huggingface"
+  nas-uploads:
+    driver: local
+    driver_opts:
+      type: cifs
+      o: "username=${NAS_USER},password=${NAS_PASS},uid=1000,gid=1000,file_mode=0770,dir_mode=0770,vers=3.0"
+      device: "${NAS_SHARE:-//192.168.1.26/odysseus}/uploads"
+  nas-generated:
+    driver: local
+    driver_opts:
+      type: cifs
+      o: "username=${NAS_USER},password=${NAS_PASS},uid=1000,gid=1000,file_mode=0770,dir_mode=0770,vers=3.0"
+      device: "${NAS_SHARE:-//192.168.1.26/odysseus}/generated_images"
+  nas-attachments:
+    driver: local
+    driver_opts:
+      type: cifs
+      o: "username=${NAS_USER},password=${NAS_PASS},uid=1000,gid=1000,file_mode=0770,dir_mode=0770,vers=3.0"
+      device: "${NAS_SHARE:-//192.168.1.26/odysseus}/mail-attachments"
+  nas-personal-docs:
+    driver: local
+    driver_opts:
+      type: cifs
+      o: "username=${NAS_USER},password=${NAS_PASS},uid=1000,gid=1000,file_mode=0770,dir_mode=0770,vers=3.0"
+      device: "${NAS_SHARE:-//192.168.1.26/odysseus}/personal_docs"
+  nas-personal-uploads:
+    driver: local
+    driver_opts:
+      type: cifs
+      o: "username=${NAS_USER},password=${NAS_PASS},uid=1000,gid=1000,file_mode=0770,dir_mode=0770,vers=3.0"
+      device: "${NAS_SHARE:-//192.168.1.26/odysseus}/personal_uploads"
